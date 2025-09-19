@@ -12,6 +12,13 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 
+# Load environment variables from .env file if it exists
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed, skip loading .env file
+
 # Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
@@ -19,8 +26,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Bot token - можно задать через переменную окружения BOT_TOKEN
-TOKEN = os.getenv('BOT_TOKEN', '8208894435:AAF7vMtFFWjqYzrToAkgJFPLl2phD2XdD6I')
+# Bot token - задается через переменную окружения BOT_TOKEN
+TOKEN = os.getenv('BOT_TOKEN')
+if not TOKEN:
+    raise ValueError("BOT_TOKEN environment variable is required!")
 
 # Temporary directory for processing
 TEMP_DIR = '/tmp/pdf_bot'
@@ -42,8 +51,18 @@ async def start(update: Update, context):
 
 def extract_top_left_quadrant(pdf_path):
     """Extract top-left quadrant from each page of a PDF."""
-    # Use system poppler for better compatibility
-    images = convert_from_path(pdf_path, poppler_path='/opt/homebrew/bin')
+    # Use system poppler - try different paths for different environments
+    try:
+        # Try without poppler_path first (for Render/Linux)
+        images = convert_from_path(pdf_path)
+    except Exception:
+        try:
+            # Try with Homebrew path (for macOS)
+            images = convert_from_path(pdf_path, poppler_path='/opt/homebrew/bin')
+        except Exception:
+            # Try with system path
+            images = convert_from_path(pdf_path, poppler_path='/usr/bin')
+    
     quadrant_images = []
     
     # Create unique timestamp for this PDF processing
