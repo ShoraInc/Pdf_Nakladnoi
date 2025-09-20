@@ -278,19 +278,32 @@ def webhook():
     """Handle incoming webhook requests from Telegram."""
     try:
         json_data = request.get_json()
-        logger.info(f"📨 Received webhook data")
+        logger.info(f"📨 Received webhook data: {json_data.get('message', {}).get('text', 'No text')[:50] if json_data else 'No data'}")
         
-        if json_data:
+        if json_data and application:
             update = Update.de_json(json_data, application.bot)
             
             # Process update in async context
             def run_async():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
                 try:
-                    loop.run_until_complete(application.process_update(update))
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    
+                    async def process():
+                        try:
+                            await application.process_update(update)
+                            logger.info("✅ Update processed successfully")
+                        except Exception as e:
+                            logger.error(f"❌ Error processing update: {e}")
+                    
+                    loop.run_until_complete(process())
+                except Exception as e:
+                    logger.error(f"❌ Async processing error: {e}")
                 finally:
-                    loop.close()
+                    try:
+                        loop.close()
+                    except:
+                        pass
             
             # Run in separate thread to avoid blocking Flask
             thread = threading.Thread(target=run_async)
@@ -300,6 +313,8 @@ def webhook():
         return 'OK'
     except Exception as e:
         logger.error(f"❌ Webhook error: {e}")
+        import traceback
+        logger.error(f"❌ Traceback: {traceback.format_exc()}")
         return 'ERROR', 500
 
 @app.route('/health', methods=['GET'])
@@ -326,6 +341,18 @@ def health():
 def ping():
     """Simple ping endpoint for monitoring services."""
     return 'PONG'
+
+@app.route('/debug', methods=['GET'])
+def debug():
+    """Debug endpoint to check bot status."""
+    return {
+        'application_initialized': application is not None,
+        'bot_username': application.bot.username if application and application.bot else None,
+        'webhook_url': WEBHOOK_URL,
+        'handlers_count': len(application.handlers) if application else 0,
+        'temp_dir': TEMP_DIR,
+        'pages_count': len(all_processed_pages)
+    }
 
 @app.route('/', methods=['GET'])
 def home():
