@@ -1,17 +1,21 @@
 #!/bin/bash
 # Install poppler for Render deployment
 
-# Update package list
-apt-get update
+echo "🔧 Installing poppler-utils..."
 
-# Install poppler-utils
+# Update package list
+apt-get update -y
+
+# Install poppler-utils and other dependencies
 apt-get install -y poppler-utils
 
 # Verify installation
-pdftoppm -h > /dev/null 2>&1
-if [ $? -eq 0 ]; then
+if command -v pdftoppm >/dev/null 2>&1; then
     echo "✅ Poppler installed successfully"
+    pdftoppm -v
 else
     echo "❌ Poppler installation failed"
     exit 1
 fi
+
+echo "🎉 Setup complete!"

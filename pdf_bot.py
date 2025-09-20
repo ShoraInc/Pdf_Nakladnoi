@@ -1,7 +1,10 @@
 import os
+import sys
 import time
 import logging
 import asyncio
+import threading
+from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from telegram.error import TimedOut, NetworkError
@@ -38,15 +41,59 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 # Global storage for all processed pages
 all_processed_pages = []
 
+# Keep-alive mechanism
+last_activity = datetime.now()
+
+def keep_alive_worker():
+    """Background worker to keep the service alive"""
+    global last_activity
+    
+    while True:
+        try:
+            current_time = datetime.now()
+            # Send a heartbeat every 10 minutes
+            if current_time - last_activity > timedelta(minutes=10):
+                logger.info(f"Heartbeat - Bot is alive at {current_time}")
+                last_activity = current_time
+            
+            # Clean up old temporary files every hour
+            try:
+                current_timestamp = time.time()
+                for file in os.listdir(TEMP_DIR):
+                    if file.startswith('quadrant_') or file.startswith('temp_'):
+                        file_path = os.path.join(TEMP_DIR, file)
+                        if os.path.exists(file_path):
+                            file_age = current_timestamp - os.path.getmtime(file_path)
+                            # Remove files older than 1 hour
+                            if file_age > 3600:
+                                os.remove(file_path)
+                                logger.info(f"Cleaned up old file: {file}")
+            except Exception as e:
+                logger.error(f"Error during cleanup: {e}")
+            
+            time.sleep(300)  # Sleep for 5 minutes
+            
+        except Exception as e:
+            logger.error(f"Keep-alive worker error: {e}")
+            time.sleep(60)  # Wait 1 minute before retrying
+
+def update_activity():
+    """Update last activity timestamp"""
+    global last_activity
+    last_activity = datetime.now()
+
 async def start(update: Update, context):
     """Send a message when the command /start is issued."""
+    update_activity()
     await update.message.reply_text(
         '👋 Привет! Отправь мне PDF-файлы, и я извлеку верхний левый квадрант каждой страницы.\n\n'
         '📄 Все обработанные страницы будут накапливаться.\n'
         '📤 /send - получить объединенный PDF со всеми страницами\n'
         '🗑️ /clear - очистить накопленные страницы\n'
-        '📊 /status - показать текущий статус\n\n'
-        '⚠️ Отправляйте файлы по одному для лучшей стабильности!'
+        '📊 /status - показать текущий статус\n'
+        '🔄 /health - проверить здоровье бота\n\n'
+        '⚠️ Отправляйте файлы по одному для лучшей стабильности!\n'
+        f'🤖 Бот запущен: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
     )
 
 def extract_top_left_quadrant(pdf_path):
@@ -54,14 +101,14 @@ def extract_top_left_quadrant(pdf_path):
     # Use system poppler - try different paths for different environments
     try:
         # Try without poppler_path first (for Render/Linux)
-        images = convert_from_path(pdf_path)
+        images = convert_from_path(pdf_path, dpi=150)  # Reduced DPI for faster processing
     except Exception:
         try:
             # Try with Homebrew path (for macOS)
-            images = convert_from_path(pdf_path, poppler_path='/opt/homebrew/bin')
+            images = convert_from_path(pdf_path, poppler_path='/opt/homebrew/bin', dpi=150)
         except Exception:
             # Try with system path
-            images = convert_from_path(pdf_path, poppler_path='/usr/bin')
+            images = convert_from_path(pdf_path, poppler_path='/usr/bin', dpi=150)
     
     quadrant_images = []
     
@@ -81,14 +128,15 @@ def extract_top_left_quadrant(pdf_path):
         
         # Save quadrant with unique name
         quadrant_path = os.path.join(TEMP_DIR, f'quadrant_{timestamp}_{i}.png')
-        quadrant.save(quadrant_path)
+        quadrant.save(quadrant_path, optimize=True)  # Optimize PNG size
         quadrant_images.append(quadrant_path)
     
     return quadrant_images
 
 def create_pdf_from_images(image_paths):
     """Convert images to PDFs with each image on a full A4 page."""
-    output_path = os.path.join(TEMP_DIR, 'combined_quadrants.pdf')
+    timestamp = int(time.time())
+    output_path = os.path.join(TEMP_DIR, f'combined_quadrants_{timestamp}.pdf')
     
     # Create a new PDF with Reportlab
     c = canvas.Canvas(output_path, pagesize=A4)
@@ -96,22 +144,33 @@ def create_pdf_from_images(image_paths):
     # A4 dimensions
     page_width, page_height = A4
     
-    for img_path in image_paths:
-        # Open the image
-        img = Image.open(img_path)
-        
-        # Resize image to fill the entire page
-        img_resized = img.resize((int(page_width), int(page_height)), Image.LANCZOS)
-        
-        # Save resized image temporarily
-        resized_path = img_path.replace('.png', '_full.png')
-        img_resized.save(resized_path)
-        
-        # Draw the image on the page
-        c.drawImage(resized_path, 0, 0, width=page_width, height=page_height)
-        
-        # Move to next page
-        c.showPage()
+    for i, img_path in enumerate(image_paths):
+        try:
+            # Open the image
+            img = Image.open(img_path)
+            
+            # Resize image to fill the entire page
+            img_resized = img.resize((int(page_width), int(page_height)), Image.LANCZOS)
+            
+            # Save resized image temporarily
+            resized_path = img_path.replace('.png', f'_full_{i}.png')
+            img_resized.save(resized_path, optimize=True)
+            
+            # Draw the image on the page
+            c.drawImage(resized_path, 0, 0, width=page_width, height=page_height)
+            
+            # Clean up resized image immediately
+            try:
+                os.remove(resized_path)
+            except:
+                pass
+            
+            # Move to next page
+            c.showPage()
+            
+        except Exception as e:
+            logger.error(f"Error processing image {img_path}: {e}")
+            continue
     
     # Save the PDF
     c.save()
@@ -121,11 +180,18 @@ def create_pdf_from_images(image_paths):
 async def handle_pdf(update: Update, context):
     """Handle incoming PDF files."""
     global all_processed_pages
+    update_activity()
     
     pdf_path = None
     wait_message = None
     
     try:
+        # Check file size before downloading
+        file_size = update.message.document.file_size
+        if file_size > 20 * 1024 * 1024:  # 20MB limit
+            await update.message.reply_text('❌ Файл слишком большой (>20MB). Отправьте файл поменьше.')
+            return
+        
         # Inform user about processing
         wait_message = await update.message.reply_text('📥 Загрузка файла...')
         
@@ -136,10 +202,10 @@ async def handle_pdf(update: Update, context):
                 timeout=60.0  # 60 seconds timeout
             )
         except asyncio.TimeoutError:
-            await update.message.reply_text('⏰ Таймаут при загрузке файла. Попробуйте еще раз.')
+            await wait_message.edit_text('⏰ Таймаут при загрузке файла. Попробуйте еще раз.')
             return
         except (TimedOut, NetworkError) as e:
-            await update.message.reply_text('🌐 Ошибка сети при загрузке файла. Попробуйте еще раз.')
+            await wait_message.edit_text('🌐 Ошибка сети при загрузке файла. Попробуйте еще раз.')
             return
         
         # Download the file
@@ -151,10 +217,10 @@ async def handle_pdf(update: Update, context):
                 timeout=120.0  # 2 minutes timeout for download
             )
         except asyncio.TimeoutError:
-            await update.message.reply_text('⏰ Таймаут при скачивании файла. Файл слишком большой.')
+            await wait_message.edit_text('⏰ Таймаут при скачивании файла. Файл слишком большой.')
             return
         except (TimedOut, NetworkError) as e:
-            await update.message.reply_text('🌐 Ошибка сети при скачивании файла. Попробуйте еще раз.')
+            await wait_message.edit_text('🌐 Ошибка сети при скачивании файла. Попробуйте еще раз.')
             return
         
         # Update status
@@ -168,8 +234,6 @@ async def handle_pdf(update: Update, context):
         
         # Log the files for debugging
         logger.info(f"Added {len(quadrant_images)} pages to storage. Total pages: {len(all_processed_pages)}")
-        for i, img_path in enumerate(quadrant_images):
-            logger.info(f"  Page {i+1}: {os.path.basename(img_path)}")
         
         # Inform user about current status
         total_pages = len(all_processed_pages)
@@ -178,6 +242,8 @@ async def handle_pdf(update: Update, context):
             f'📄 Всего накоплено страниц: {total_pages}\n'
             f'📤 Используй /send для получения объединенного PDF'
         )
+        
+        update_activity()
     
     except Exception as e:
         error_msg = f'❌ Ошибка: {str(e)}'
@@ -198,6 +264,7 @@ async def handle_pdf(update: Update, context):
 async def send_combined_pdf(update: Update, context):
     """Send combined PDF with all processed pages."""
     global all_processed_pages
+    update_activity()
     
     if not all_processed_pages:
         await update.message.reply_text('📭 Нет обработанных страниц. Сначала отправь PDF файлы!')
@@ -226,6 +293,7 @@ async def send_combined_pdf(update: Update, context):
                 await asyncio.wait_for(
                     update.message.reply_document(
                         pdf_file, 
+                        filename=f'combined_quadrants_{int(time.time())}.pdf',
                         caption=f'✅ Объединенный PDF готов! Всего страниц: {len(all_processed_pages)}'
                     ),
                     timeout=300.0  # 5 minutes timeout for sending
@@ -238,6 +306,7 @@ async def send_combined_pdf(update: Update, context):
             return
         
         await wait_message.edit_text('✅ PDF успешно отправлен!')
+        update_activity()
             
     except Exception as e:
         error_msg = f'❌ Ошибка при создании PDF: {str(e)}'
@@ -258,6 +327,7 @@ async def send_combined_pdf(update: Update, context):
 async def clear_pages(update: Update, context):
     """Clear all accumulated pages."""
     global all_processed_pages
+    update_activity()
     
     page_count = len(all_processed_pages)
     all_processed_pages.clear()
@@ -277,21 +347,103 @@ async def clear_pages(update: Update, context):
 
 async def status(update: Update, context):
     """Show current status."""
-    global all_processed_pages
+    global all_processed_pages, last_activity
+    update_activity()
     
     page_count = len(all_processed_pages)
+    uptime = datetime.now() - last_activity
+    
+    status_msg = f'📊 Статус:\n'
     if page_count == 0:
-        await update.message.reply_text('📭 Нет накопленных страниц. Отправьте PDF файлы для обработки.')
+        status_msg += '📭 Нет накопленных страниц.\n'
     else:
-        await update.message.reply_text(
-            f'📊 Статус:\n'
-            f'📄 Накоплено страниц: {page_count}\n'
-            f'📤 Используйте /send для получения объединенного PDF\n'
-            f'🗑️ Используйте /clear для очистки'
-        )
+        status_msg += f'📄 Накоплено страниц: {page_count}\n'
+        status_msg += f'📤 Используйте /send для получения PDF\n'
+        status_msg += f'🗑️ Используйте /clear для очистки\n'
+    
+    status_msg += f'⏰ Последняя активность: {last_activity.strftime("%H:%M:%S")}'
+    
+    await update.message.reply_text(status_msg)
+
+async def health_check(update: Update, context):
+    """Health check command."""
+    global last_activity
+    update_activity()
+    
+    current_time = datetime.now()
+    uptime = current_time - last_activity
+    
+    # Check disk space
+    disk_usage = "Unknown"
+    try:
+        import shutil
+        total, used, free = shutil.disk_usage(TEMP_DIR)
+        disk_usage = f"{free // (1024**2)} MB free"
+    except:
+        pass
+    
+    # Check memory usage
+    memory_usage = "Unknown"
+    try:
+        import psutil
+        memory = psutil.virtual_memory()
+        memory_usage = f"{memory.percent}% used"
+    except:
+        pass
+    
+    health_msg = (
+        f'🏥 Проверка здоровья:\n'
+        f'✅ Бот работает\n'
+        f'⏰ Текущее время: {current_time.strftime("%Y-%m-%d %H:%M:%S")}\n'
+        f'💾 Диск: {disk_usage}\n'
+        f'🧠 Память: {memory_usage}\n'
+        f'📁 Temp файлов: {len(os.listdir(TEMP_DIR))}\n'
+        f'📄 Накоплено страниц: {len(all_processed_pages)}'
+    )
+    
+    await update.message.reply_text(health_msg)
 
 def main():
     """Start the bot."""
+    # Start keep-alive worker in background
+    keepalive_thread = threading.Thread(target=keep_alive_worker, daemon=True)
+    keepalive_thread.start()
+    
+    logger.info("Starting PDF bot with keep-alive mechanism...")
+    logger.info(f"Python version: {os.sys.version}")
+    logger.info(f"Temp directory: {TEMP_DIR}")
+    
+    # Check if running on Render
+    if os.getenv('RENDER'):
+        logger.info("Running on Render platform")
+        port = int(os.getenv('PORT', 8080))
+        
+        # Start simple HTTP server for Render health checks
+        def start_http_server():
+            from http.server import HTTPServer, BaseHTTPRequestHandler
+            
+            class HealthHandler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    if self.path == '/health':
+                        self.send_response(200)
+                        self.send_header('Content-type', 'text/plain')
+                        self.end_headers()
+                        self.wfile.write(b'OK')
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+                
+                def log_message(self, format, *args):
+                    pass  # Suppress HTTP logs
+            
+            server = HTTPServer(('0.0.0.0', port), HealthHandler)
+            server.serve_forever()
+        
+        # Start HTTP server in background for Render
+        http_thread = threading.Thread(target=start_http_server, daemon=True)
+        http_thread.start()
+        logger.info(f"HTTP health check server started on port {port}")
+    
     application = Application.builder().token(TOKEN).build()
     
     # Command handlers
@@ -299,12 +451,41 @@ def main():
     application.add_handler(CommandHandler("send", send_combined_pdf))
     application.add_handler(CommandHandler("clear", clear_pages))
     application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("health", health_check))
     
     # Message handlers
     application.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
     
-    # Start the Bot
-    application.run_polling(drop_pending_updates=True)
+    # Start the Bot with error handling and retries
+    max_retries = 5
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            logger.info(f"Starting bot polling (attempt {retry_count + 1})...")
+            application.run_polling(
+                drop_pending_updates=True,
+                poll_interval=2.0,  # Poll every 2 seconds
+                timeout=20,         # 20 seconds timeout for getUpdates
+                read_timeout=30,    # 30 seconds read timeout
+                write_timeout=30    # 30 seconds write timeout
+            )
+            break  # If we reach here, polling ended normally
+            
+        except KeyboardInterrupt:
+            logger.info("Received interrupt signal, shutting down...")
+            break
+        except Exception as e:
+            retry_count += 1
+            logger.error(f"Bot crashed (attempt {retry_count}/{max_retries}): {e}")
+            
+            if retry_count < max_retries:
+                wait_time = min(60 * retry_count, 300)  # Exponential backoff, max 5 minutes
+                logger.info(f"Restarting in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                logger.error("Max retries reached, giving up")
+                raise
 
 if __name__ == '__main__':
     main()
