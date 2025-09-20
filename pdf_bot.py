@@ -34,12 +34,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Reduce noise from other loggers
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('telegram').setLevel(logging.INFO)
+
 # Bot configuration
 TOKEN = os.getenv('BOT_TOKEN')
 if not TOKEN:
     raise ValueError("BOT_TOKEN environment variable is required!")
 
-WEBHOOK_URL = os.getenv('WEBHOOK_URL')  # https://your-app-name.onrender.com/webhook
+WEBHOOK_URL = os.getenv('WEBHOOK_URL')  # https://your-app-name.onrender.com
 PORT = int(os.getenv('PORT', 8080))
 
 # Temporary directory for processing
@@ -48,6 +52,7 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 
 # Global storage for all processed pages
 all_processed_pages = []
+start_time = datetime.now()
 
 # Flask app for webhook
 app = Flask(__name__)
@@ -57,14 +62,16 @@ application = None
 
 async def start(update: Update, context):
     """Send a message when the command /start is issued."""
+    uptime = datetime.now() - start_time
     await update.message.reply_text(
-        '👋 Привет! Отправь мне PDF-файлы, и я извлеку верхний левый квадрант каждой страницы.\n\n'
-        '📄 Все обработанные страницы будут накапливаться.\n'
-        '📤 /send - получить объединенный PDF со всеми страницами\n'
-        '🗑️ /clear - очистить накопленные страницы\n'
-        '📊 /status - показать текущий статус\n'
-        '🌐 Работаю через Webhook на Render!\n\n'
-        '⚠️ Отправляйте файлы по одному для лучшей стабильности!'
+        f'👋 Привет! Отправь мне PDF-файлы, и я извлеку верхний левый квадрант каждой страницы.\n\n'
+        f'📄 Все обработанные страницы будут накапливаться.\n'
+        f'📤 /send - получить объединенный PDF со всеми страницами\n'
+        f'🗑️ /clear - очистить накопленные страницы\n'
+        f'📊 /status - показать текущий статус\n'
+        f'🌐 Работаю через Webhook на Render!\n'
+        f'⏰ Время работы: {str(uptime).split(".")[0]}\n\n'
+        f'⚠️ Отправляйте файлы по одному для лучшей стабильности!'
     )
 
 def extract_top_left_quadrant(pdf_path):
@@ -248,17 +255,20 @@ async def clear_pages(update: Update, context):
 
 async def status(update: Update, context):
     """Show current status."""
-    global all_processed_pages
+    global all_processed_pages, start_time
     
     page_count = len(all_processed_pages)
     current_time = datetime.now()
+    uptime = current_time - start_time
     
     if page_count == 0:
         status_msg = '📭 Нет накопленных страниц.'
     else:
         status_msg = f'📄 Накоплено страниц: {page_count}\n📤 /send для получения PDF'
     
-    status_msg += f'\n⏰ Время: {current_time.strftime("%H:%M:%S")}\n🌐 Webhook режим активен'
+    status_msg += f'\n⏰ Время: {current_time.strftime("%H:%M:%S")}'
+    status_msg += f'\n🚀 Время работы: {str(uptime).split(".")[0]}'
+    status_msg += f'\n🌐 Webhook режим активен'
     
     await update.message.reply_text(status_msg)
 
@@ -268,7 +278,7 @@ def webhook():
     """Handle incoming webhook requests from Telegram."""
     try:
         json_data = request.get_json()
-        logger.info(f"📨 Received webhook data: {bool(json_data)}")
+        logger.info(f"📨 Received webhook data")
         
         if json_data:
             update = Update.de_json(json_data, application.bot)
@@ -283,7 +293,6 @@ def webhook():
                     loop.close()
             
             # Run in separate thread to avoid blocking Flask
-            import threading
             thread = threading.Thread(target=run_async)
             thread.daemon = True
             thread.start()
@@ -295,30 +304,93 @@ def webhook():
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check endpoint for Render."""
+    """Health check endpoint for external monitoring services."""
+    uptime_seconds = int((datetime.now() - start_time).total_seconds())
+    
+    # Clean up old files periodically
+    try:
+        if uptime_seconds % 3600 == 0:  # Every hour
+            cleanup_old_files()
+    except:
+        pass
+    
     return {
         'status': 'healthy',
         'time': datetime.now().isoformat(),
-        'pages': len(all_processed_pages)
+        'uptime_seconds': uptime_seconds,
+        'pages_accumulated': len(all_processed_pages),
+        'temp_files': len([f for f in os.listdir(TEMP_DIR) if f.startswith('quadrant_')])
     }
+
+@app.route('/ping', methods=['GET', 'POST'])
+def ping():
+    """Simple ping endpoint for monitoring services."""
+    return 'PONG'
 
 @app.route('/', methods=['GET'])
 def home():
-    """Home page."""
+    """Home page with bot status."""
+    uptime = datetime.now() - start_time
     return f"""
-    <h1>🤖 PDF Bot is Running!</h1>
-    <p>Status: ✅ Healthy</p>
-    <p>Time: {datetime.now()}</p>
-    <p>Pages accumulated: {len(all_processed_pages)}</p>
-    <p>Bot: @{TOKEN.split(':')[0] if TOKEN else 'Unknown'}</p>
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>PDF Bot Status</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }}
+            .container {{ background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+            h1 {{ color: #2e7d32; }}
+            .status {{ color: #4caf50; font-weight: bold; }}
+            .info {{ margin: 10px 0; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🤖 PDF Bot Status</h1>
+            <div class="status">✅ Running</div>
+            <div class="info">⏰ Current Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+            <div class="info">🚀 Uptime: {str(uptime).split('.')[0]}</div>
+            <div class="info">📄 Pages Accumulated: {len(all_processed_pages)}</div>
+            <div class="info">🌐 Mode: Webhook</div>
+            <div class="info">🔧 Version: 1.0</div>
+            
+            <hr style="margin: 20px 0;">
+            
+            <h3>Monitoring Endpoints:</h3>
+            <ul>
+                <li><a href="/health">/health</a> - Health check (JSON)</li>
+                <li><a href="/ping">/ping</a> - Simple ping</li>
+            </ul>
+            
+            <p><strong>For UptimeRobot:</strong> Use /ping endpoint</p>
+            <p><strong>For Cron-job.org:</strong> Use /health endpoint</p>
+        </div>
+    </body>
+    </html>
     """
+
+def cleanup_old_files():
+    """Clean up old temporary files."""
+    try:
+        current_time = time.time()
+        for file in os.listdir(TEMP_DIR):
+            if file.startswith('quadrant_') or file.startswith('temp_') or file.startswith('combined_'):
+                file_path = os.path.join(TEMP_DIR, file)
+                if os.path.exists(file_path):
+                    file_age = current_time - os.path.getmtime(file_path)
+                    if file_age > 3600:  # Remove files older than 1 hour
+                        os.remove(file_path)
+                        logger.info(f"Cleaned up old file: {file}")
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}")
 
 async def setup_webhook():
     """Set up webhook for Telegram bot."""
     global application
     
     try:
-        # Initialize application
         application = Application.builder().token(TOKEN).build()
         
         # Add handlers
@@ -328,7 +400,6 @@ async def setup_webhook():
         application.add_handler(CommandHandler("status", status))
         application.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
         
-        # Initialize application
         await application.initialize()
         await application.start()
         
@@ -338,11 +409,10 @@ async def setup_webhook():
             await application.bot.set_webhook(webhook_url)
             logger.info(f"✅ Webhook set to: {webhook_url}")
             
-            # Test webhook
             webhook_info = await application.bot.get_webhook_info()
             logger.info(f"🔍 Webhook info: {webhook_info.url}")
         else:
-            logger.warning("⚠️ WEBHOOK_URL not set - bot will work in development mode")
+            logger.warning("⚠️ WEBHOOK_URL not set - running in development mode")
                 
         logger.info("✅ Bot setup complete")
         
@@ -359,6 +429,7 @@ def main():
     logger.info(f"Port: {PORT}")
     logger.info(f"Webhook URL: {WEBHOOK_URL}")
     logger.info(f"Bot token: {TOKEN[:10]}..." if TOKEN else "No token")
+    logger.info(f"Temp directory: {TEMP_DIR}")
     
     # Setup webhook
     loop = asyncio.new_event_loop()
@@ -366,8 +437,13 @@ def main():
     loop.run_until_complete(setup_webhook())
     loop.close()
     
+    # Start cleanup thread
+    cleanup_thread = threading.Thread(target=lambda: [time.sleep(3600), cleanup_old_files()], daemon=True)
+    cleanup_thread.start()
+    
     # Start Flask app
     logger.info("🌐 Starting Flask webhook server...")
+    logger.info("📊 Bot ready for monitoring!")
     app.run(host='0.0.0.0', port=PORT, debug=False)
 
 if __name__ == '__main__':
